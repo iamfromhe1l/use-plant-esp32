@@ -11,8 +11,8 @@ const char* apPassword = NULL;
 const int DNS_PORT = 53;
 const int HTTP_PORT = 80;
 
-// MQTT настройки
-const char* MQTT_SERVER = "192.168.0.105";
+const char* DEFAULT_BACKEND_HOST = "192.168.0.104";
+const char* DEFAULT_BACKEND_URL = "http://192.168.0.104:4000";
 const int MQTT_PORT = 1883;
 const unsigned long MQTT_RECONNECT_INTERVAL = 5000;
 
@@ -27,7 +27,8 @@ String savedSSID = "";
 String savedPassword = "";
 String savedToken = "";
 String savedDeviceSecret = "";
-String savedBackendUrl = "http://192.168.0.105:4000";
+String savedBackendUrl = DEFAULT_BACKEND_URL;
+String savedMqttServer = DEFAULT_BACKEND_HOST;
 bool shouldSaveConfig = false;
 bool configMode = false;
 unsigned long lastMqttReconnect = 0;
@@ -65,6 +66,27 @@ struct BackendResponse {
   String deviceSecret;
   String error;
 };
+
+String extractHostFromUrl(const String& url) {
+  String host = url;
+
+  int schemePos = host.indexOf("://");
+  if (schemePos >= 0) {
+    host = host.substring(schemePos + 3);
+  }
+
+  int slashPos = host.indexOf('/');
+  if (slashPos >= 0) {
+    host = host.substring(0, slashPos);
+  }
+
+  int colonPos = host.indexOf(':');
+  if (colonPos >= 0) {
+    host = host.substring(0, colonPos);
+  }
+
+  return host;
+}
 
 // ===== Logging =====
 
@@ -451,7 +473,7 @@ void connectMqtt() {
   String clientId = "esp32-" + deviceId;
   String commandsTopic = "devices/" + deviceId + "/commands";
 
-  printDebug("Подключение к MQTT: " + String(MQTT_SERVER));
+  printDebug("Подключение к MQTT: " + savedMqttServer);
 
   if (mqttClient.connect(clientId.c_str())) {
     printSuccess("MQTT подключен!");
@@ -608,6 +630,8 @@ void startAccessPoint() {
     dataDoc["configured"] = (savedSSID.length() > 0);
     dataDoc["mode"] = "config";
     dataDoc["ssid"] = savedSSID;
+    dataDoc["backendUrl"] = savedBackendUrl;
+    dataDoc["mqttServer"] = savedMqttServer;
 
     sendSuccessResponse(dataDoc);
   });
@@ -655,10 +679,16 @@ void startAccessPoint() {
     const char* ssid = doc["ssid"];
     const char* password = doc["password"];
     const char* token = doc["token"];
+    String backendUrl = doc["backendUrl"] | DEFAULT_BACKEND_URL;
+    String mqttServer = doc["mqttServer"] | "";
 
     if (!ssid || !password || !token) {
       sendErrorResponse("SSID, пароль и токен обязательны", "MISSING_FIELDS");
       return;
+    }
+
+    if (mqttServer.length() == 0) {
+      mqttServer = extractHostFromUrl(backendUrl);
     }
 
     printDebug("Сохранение настроек WiFi");
@@ -668,11 +698,15 @@ void startAccessPoint() {
     preferences.putString("ssid", ssid);
     preferences.putString("password", password);
     preferences.putString("token", token);
+    preferences.putString("backendUrl", backendUrl);
+    preferences.putString("mqttServer", mqttServer);
     preferences.end();
 
     savedSSID = ssid;
     savedPassword = password;
     savedToken = token;
+    savedBackendUrl = backendUrl;
+    savedMqttServer = mqttServer;
 
     sendSuccessMessage("Настройки сохранены. Устройство перезагружается...");
     shouldSaveConfig = true;
@@ -700,6 +734,8 @@ void clearWiFiSettings() {
   savedPassword = "";
   savedToken = "";
   savedDeviceSecret = "";
+  savedBackendUrl = DEFAULT_BACKEND_URL;
+  savedMqttServer = DEFAULT_BACKEND_HOST;
 
   printSuccess("WiFi настройки очищены");
 }
@@ -728,6 +764,8 @@ void setup() {
   savedPassword = preferences.getString("password", "");
   savedToken = preferences.getString("token", "");
   savedDeviceSecret = preferences.getString("deviceSecret", "");
+  savedBackendUrl = preferences.getString("backendUrl", DEFAULT_BACKEND_URL);
+  savedMqttServer = preferences.getString("mqttServer", extractHostFromUrl(savedBackendUrl));
   preferences.end();
 
   if (savedSSID.length() > 0 && savedPassword.length() > 0) {
@@ -774,7 +812,7 @@ void setup() {
       }
 
       // Настраиваем MQTT и переходим в нормальный режим
-      mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+      mqttClient.setServer(savedMqttServer.c_str(), MQTT_PORT);
       mqttClient.setCallback(onMqttMessage);
       mqttClient.setBufferSize(2048);
       connectMqtt();
