@@ -5,6 +5,7 @@
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <PubSubClient.h>
+#include <DHTesp.h>
 
 const char* apSSID = "PlantWatering-ESP32";
 const char* apPassword = NULL;
@@ -15,6 +16,8 @@ const char* DEFAULT_BACKEND_HOST = "192.168.0.104";
 const char* DEFAULT_BACKEND_URL = "http://192.168.0.104:4000";
 const int MQTT_PORT = 1883;
 const unsigned long MQTT_RECONNECT_INTERVAL = 5000;
+const int DHT_PIN = 4; // Board pin label: D4 / GPIO4
+const unsigned long DHT_READ_INTERVAL = 2500;
 
 DNSServer dnsServer;
 WebServer server(HTTP_PORT);
@@ -22,6 +25,7 @@ Preferences preferences;
 HTTPClient http;
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
+DHTesp dhtSensor;
 
 String savedSSID = "";
 String savedPassword = "";
@@ -34,6 +38,11 @@ bool configMode = false;
 unsigned long lastMqttReconnect = 0;
 unsigned long lastTelemetrySend = 0;
 const unsigned long TELEMETRY_INTERVAL = 60000; // 1 минута
+unsigned long lastDhtRead = 0;
+unsigned long lastDhtErrorLog = 0;
+float lastAirTemperature = 22.0f;
+float lastAirHumidity = 50.0f;
+bool hasValidDhtReading = false;
 
 // ===== Structs =====
 
@@ -283,12 +292,40 @@ void checkConditions() {
 
 // ===== Sensors (mock) =====
 
+void updateAirSensorReadings(bool force = false) {
+  unsigned long now = millis();
+
+  if (!force && (now - lastDhtRead) < DHT_READ_INTERVAL) {
+    return;
+  }
+
+  lastDhtRead = now;
+
+  TempAndHumidity data = dhtSensor.getTempAndHumidity();
+
+  if (isnan(data.temperature) || isnan(data.humidity)) {
+    if ((now - lastDhtErrorLog) > 30000) {
+      lastDhtErrorLog = now;
+      printWarning("Не удалось прочитать DHT22, используются последние корректные значения");
+    }
+    return;
+  }
+
+  lastAirTemperature = data.temperature;
+  lastAirHumidity = data.humidity;
+  hasValidDhtReading = true;
+}
+
 float getTemperature(int plantIndex) {
-  return 18.0 + (float)random(0, 120) / 10.0;
+  (void)plantIndex;
+  updateAirSensorReadings();
+  return hasValidDhtReading ? lastAirTemperature : 22.0f;
 }
 
 float getAirHumidity(int plantIndex) {
-  return 40.0 + (float)random(0, 400) / 10.0;
+  (void)plantIndex;
+  updateAirSensorReadings();
+  return hasValidDhtReading ? lastAirHumidity : 50.0f;
 }
 
 float getSoilMoisture(int plantIndex) {
@@ -754,6 +791,9 @@ void setup() {
 
   String deviceId = String((uint32_t)ESP.getEfuseMac(), HEX);
   printSuccess("Device ID: " + deviceId);
+  dhtSensor.setup(DHT_PIN, DHTesp::DHT22);
+  updateAirSensorReadings(true);
+  printSuccess("DHT22 инициализирован на пине D4/GPIO4");
 
   registerCommands();
   loadConditionsFromNVS();
