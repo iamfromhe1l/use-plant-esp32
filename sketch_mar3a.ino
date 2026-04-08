@@ -6,6 +6,8 @@
 #include <HTTPClient.h>
 #include <PubSubClient.h>
 #include <DHTesp.h>
+#include <Wire.h>
+#include <U8g2lib.h>
 
 const char* apSSID = "PlantWatering-ESP32";
 const char* apPassword = NULL;
@@ -22,6 +24,11 @@ const int SOIL_DRY_VALUES[2] = {3000, 3000};
 const int SOIL_WET_VALUES[2] = {1300, 1300};
 const int SOIL_SAMPLE_COUNT = 8;
 const unsigned long DHT_READ_INTERVAL = 2500;
+const int DISPLAY_SDA_PIN = 21; // Board pin label: D21 / GPIO21
+const int DISPLAY_SCL_PIN = 22; // Board pin label: D22 / GPIO22
+const unsigned long DISPLAY_REFRESH_INTERVAL = 120;
+const unsigned long SOIL_READ_INTERVAL = 1500;
+const unsigned long WATERING_ANIMATION_DURATION = 5000;
 
 DNSServer dnsServer;
 WebServer server(HTTP_PORT);
@@ -30,6 +37,7 @@ HTTPClient http;
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 DHTesp dhtSensor;
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
 
 String savedSSID = "";
 String savedPassword = "";
@@ -47,6 +55,28 @@ unsigned long lastDhtErrorLog = 0;
 float lastAirTemperature = 22.0f;
 float lastAirHumidity = 50.0f;
 bool hasValidDhtReading = false;
+unsigned long lastSoilRead = 0;
+float lastSoilMoisture[2] = {0.0f, 0.0f};
+int lastSoilRawValues[2] = {0, 0};
+bool hasValidSoilReadings = false;
+unsigned long lastDisplayRefresh = 0;
+unsigned long wateringAnimationUntil = 0;
+int wateringAnimationPlant = 1;
+int wateringAnimationLevel = 5;
+
+enum DisplayState {
+  DISPLAY_BOOT,
+  DISPLAY_WIFI_SETUP,
+  DISPLAY_WIFI_CONNECTING,
+  DISPLAY_REGISTERING,
+  DISPLAY_MQTT_CONNECTING,
+  DISPLAY_NORMAL,
+  DISPLAY_ERROR
+};
+
+DisplayState currentDisplayState = DISPLAY_BOOT;
+String displayPrimaryText = "usePlant";
+String displaySecondaryText = "starting";
 
 // ===== Structs =====
 
@@ -99,6 +129,168 @@ String extractHostFromUrl(const String& url) {
   }
 
   return host;
+}
+
+void setDisplayState(DisplayState state, const String& primary = "", const String& secondary = "") {
+  currentDisplayState = state;
+
+  if (primary.length() > 0 || state == DISPLAY_NORMAL) {
+    displayPrimaryText = primary;
+  }
+
+  if (secondary.length() > 0 || state == DISPLAY_NORMAL) {
+    displaySecondaryText = secondary;
+  }
+}
+
+void startWateringAnimation(int plantIndex, int level) {
+  wateringAnimationPlant = plantIndex;
+  wateringAnimationLevel = level;
+  wateringAnimationUntil = millis() + WATERING_ANIMATION_DURATION;
+}
+
+void drawCenteredText(int y, const String& text) {
+  int width = oled.getStrWidth(text.c_str());
+  int x = (128 - width) / 2;
+  if (x < 0) x = 0;
+  oled.drawStr(x, y, text.c_str());
+}
+
+void drawChip(int x, int y, const char* label, bool active) {
+  int width = oled.getStrWidth(label) + 12;
+
+  if (active) {
+    oled.drawRBox(x, y, width, 14, 6);
+    oled.setDrawColor(0);
+    oled.drawStr(x + 6, y + 10, label);
+    oled.setDrawColor(1);
+  } else {
+    oled.drawRFrame(x, y, width, 14, 6);
+    oled.drawStr(x + 6, y + 10, label);
+  }
+}
+
+void drawSoilCard(int x, int y, const char* label, float moisturePercent) {
+  char valueBuffer[8];
+  int value = (int)(moisturePercent + 0.5f);
+  if (value < 0) value = 0;
+  if (value > 100) value = 100;
+  snprintf(valueBuffer, sizeof(valueBuffer), "%d%%", value);
+
+  oled.drawRFrame(x, y, 58, 26, 8);
+  oled.setFont(u8g2_font_6x12_tf);
+  oled.drawStr(x + 6, y + 11, label);
+  oled.setFont(u8g2_font_7x13B_tf);
+  oled.drawStr(x + 6, y + 23, valueBuffer);
+
+  int barWidth = 20;
+  int fillWidth = (int)((barWidth * value) / 100.0f);
+  oled.drawRFrame(x + 31, y + 16, barWidth, 6, 3);
+  if (fillWidth > 0) {
+    oled.drawRBox(x + 32, y + 17, fillWidth - (fillWidth == barWidth ? 0 : 1), 4, 2);
+  }
+}
+
+void drawStatusScene(const String& title, const String& subtitle, unsigned long frame) {
+  int dotCount = (int)((frame / 10) % 4) + 1;
+  String loadingDots = "";
+  for (int i = 0; i < dotCount; i++) {
+    loadingDots += ".";
+  }
+
+  oled.drawRFrame(6, 6, 116, 52, 10);
+  oled.drawRFrame(14, 14, 100, 36, 8);
+  oled.drawDisc(24 + (int)((frame / 3) % 14), 22, 2);
+  oled.drawDisc(100 - (int)((frame / 4) % 12), 42, 1);
+
+  oled.setFont(u8g2_font_7x13B_tf);
+  drawCenteredText(27, title);
+  oled.setFont(u8g2_font_6x12_tf);
+  drawCenteredText(40, subtitle);
+  drawCenteredText(53, loadingDots);
+}
+
+void drawWateringScene(unsigned long frame) {
+  char plantBuffer[16];
+  char levelBuffer[16];
+  int pulse = (int)((frame / 2) % 10);
+
+  snprintf(plantBuffer, sizeof(plantBuffer), "Plant %d", wateringAnimationPlant);
+  snprintf(levelBuffer, sizeof(levelBuffer), "Level %d", wateringAnimationLevel);
+
+  oled.drawRFrame(2, 2, 124, 60, 12);
+  oled.drawRFrame(8, 8, 112, 48, 10);
+
+  oled.setFont(u8g2_font_7x13B_tf);
+  drawCenteredText(18, "WATERING");
+  oled.setFont(u8g2_font_6x12_tf);
+  drawCenteredText(31, plantBuffer);
+  drawCenteredText(42, levelBuffer);
+
+  for (int i = 0; i < 4; i++) {
+    int baseX = 26 + i * 24;
+    int y = 48 + ((frame + i * 3) % 9) - 4;
+    oled.drawDisc(baseX, y, 2 + ((pulse + i) % 3));
+  }
+
+  oled.drawEllipse(64, 56, 28 + (pulse / 2), 5);
+}
+
+void drawDashboard() {
+  char airBuffer[20];
+  char humidityBuffer[16];
+
+  oled.setFont(u8g2_font_6x12_tf);
+  drawChip(4, 4, "WiFi", WiFi.status() == WL_CONNECTED);
+  drawChip(50, 4, "MQTT", mqttClient.connected());
+  oled.drawRFrame(94, 4, 30, 14, 6);
+  oled.drawStr(100, 14, "AIR");
+
+  drawSoilCard(4, 22, "P1", getSoilMoisture(1));
+  drawSoilCard(66, 22, "P2", getSoilMoisture(2));
+
+  snprintf(airBuffer, sizeof(airBuffer), "%.1fC", getTemperature(1));
+  snprintf(humidityBuffer, sizeof(humidityBuffer), "%.0f%%", getAirHumidity(1));
+
+  oled.drawRFrame(4, 50, 120, 12, 6);
+  oled.setFont(u8g2_font_6x12_tf);
+  oled.drawStr(10, 59, airBuffer);
+  oled.drawStr(56, 59, humidityBuffer);
+  oled.drawDisc(104, 56, 2);
+  oled.drawCircle(112, 56, 3);
+}
+
+void updateDisplay(bool force = false) {
+  unsigned long now = millis();
+
+  if (!force && (now - lastDisplayRefresh) < DISPLAY_REFRESH_INTERVAL) {
+    return;
+  }
+
+  lastDisplayRefresh = now;
+
+  oled.clearBuffer();
+
+  if (wateringAnimationUntil > now) {
+    drawWateringScene(now / 60);
+  } else {
+    switch (currentDisplayState) {
+      case DISPLAY_BOOT:
+      case DISPLAY_WIFI_SETUP:
+      case DISPLAY_WIFI_CONNECTING:
+      case DISPLAY_REGISTERING:
+      case DISPLAY_MQTT_CONNECTING:
+      case DISPLAY_ERROR:
+        drawStatusScene(displayPrimaryText, displaySecondaryText, now / 80);
+        break;
+      case DISPLAY_NORMAL:
+      default:
+        drawDashboard();
+        break;
+    }
+  }
+
+  oled.sendBuffer();
 }
 
 // ===== Logging =====
@@ -244,6 +436,7 @@ bool evaluateRule(const SensorRule& rule, int plantIndex) {
 }
 
 void triggerWatering(int plantIndex, int level) {
+  startWateringAnimation(plantIndex, level);
   if (plantIndex == 1) {
     printSuccess("[MOCK] Авто-полив растения 1, уровень: " + String(level));
   } else {
@@ -321,6 +514,24 @@ int readSoilMoistureRaw(int plantIndex) {
   return (int)(total / SOIL_SAMPLE_COUNT);
 }
 
+void updateSoilReadings(bool force = false) {
+  unsigned long now = millis();
+
+  if (!force && (now - lastSoilRead) < SOIL_READ_INTERVAL) {
+    return;
+  }
+
+  lastSoilRead = now;
+
+  for (int i = 0; i < 2; i++) {
+    int rawValue = readSoilMoistureRaw(i + 1);
+    lastSoilRawValues[i] = rawValue;
+    lastSoilMoisture[i] = convertSoilRawToPercent(rawValue, i + 1);
+  }
+
+  hasValidSoilReadings = true;
+}
+
 float convertSoilRawToPercent(int rawValue, int plantIndex) {
   int sensorIndex = getSoilSensorIndex(plantIndex);
   int dryValue = SOIL_DRY_VALUES[sensorIndex];
@@ -375,8 +586,14 @@ float getAirHumidity(int plantIndex) {
 }
 
 float getSoilMoisture(int plantIndex) {
-  int rawValue = readSoilMoistureRaw(plantIndex);
-  return convertSoilRawToPercent(rawValue, plantIndex);
+  int sensorIndex = getSoilSensorIndex(plantIndex);
+  updateSoilReadings();
+
+  if (!hasValidSoilReadings) {
+    return 0.0f;
+  }
+
+  return lastSoilMoisture[sensorIndex];
 }
 
 // ===== Command Handlers =====
@@ -406,6 +623,7 @@ void handleCmd_waterPlant1(JsonObject& payload) {
   int level = payload["level"] | 5;
   if (level < 1) level = 1;
   if (level > 10) level = 10;
+  startWateringAnimation(1, level);
   printSuccess("[MOCK] Полив растения 1, уровень: " + String(level));
 }
 
@@ -413,6 +631,7 @@ void handleCmd_waterPlant2(JsonObject& payload) {
   int level = payload["level"] | 5;
   if (level < 1) level = 1;
   if (level > 10) level = 10;
+  startWateringAnimation(2, level);
   printSuccess("[MOCK] Полив растения 2, уровень: " + String(level));
 }
 
@@ -558,12 +777,14 @@ void connectMqtt() {
   String commandsTopic = "devices/" + deviceId + "/commands";
 
   printDebug("Подключение к MQTT: " + savedMqttServer);
+  setDisplayState(DISPLAY_MQTT_CONNECTING, "MQTT link", "connecting");
 
   if (mqttClient.connect(clientId.c_str())) {
     printSuccess("MQTT подключен!");
 
     mqttClient.subscribe(commandsTopic.c_str(), 1);
     printSuccess("Подписка на топик: " + commandsTopic);
+    setDisplayState(DISPLAY_NORMAL, "", "");
   } else {
     printError("MQTT ошибка подключения, rc=" + String(mqttClient.state()));
   }
@@ -705,6 +926,7 @@ void startAccessPoint() {
 
   IPAddress apIP = WiFi.softAPIP();
   printSuccess("IP точки доступа: " + apIP.toString());
+  setDisplayState(DISPLAY_WIFI_SETUP, "WiFi setup", apSSID);
 
   dnsServer.start(DNS_PORT, "*", apIP);
 
@@ -830,6 +1052,11 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   randomSeed(analogRead(0));
+  Wire.begin(DISPLAY_SDA_PIN, DISPLAY_SCL_PIN);
+  oled.begin();
+  oled.setContrast(180);
+  setDisplayState(DISPLAY_BOOT, "usePlant", "starting");
+  updateDisplay(true);
 
   Serial.println();
   Serial.println("=================================");
@@ -843,7 +1070,10 @@ void setup() {
   printSuccess("DHT22 инициализирован на пине D4/GPIO4");
   pinMode(SOIL_SENSOR_PINS[0], INPUT);
   pinMode(SOIL_SENSOR_PINS[1], INPUT);
+  updateSoilReadings(true);
   printSuccess("Датчики влажности почвы инициализированы на D34 и D35");
+  printSuccess("OLED инициализирован на D21/D22 (I2C)");
+  updateDisplay(true);
 
   registerCommands();
   loadConditionsFromNVS();
@@ -860,6 +1090,8 @@ void setup() {
 
   if (savedSSID.length() > 0 && savedPassword.length() > 0) {
     printDebug("Попытка подключения к WiFi: " + savedSSID);
+    setDisplayState(DISPLAY_WIFI_CONNECTING, "Joining WiFi", savedSSID);
+    updateDisplay(true);
 
     WiFi.mode(WIFI_STA);
     WiFi.begin(savedSSID.c_str(), savedPassword.c_str());
@@ -869,6 +1101,7 @@ void setup() {
       delay(500);
       Serial.print(".");
       attempts++;
+      updateDisplay();
     }
     Serial.println();
 
@@ -879,6 +1112,8 @@ void setup() {
       // Если есть токен, но нет deviceSecret - регистрируемся
       if (savedToken.length() > 0 && savedDeviceSecret.length() == 0) {
         printDebug("Устройство не зарегистрировано. Регистрация на бэкенде...");
+        setDisplayState(DISPLAY_REGISTERING, "Cloud link", "registering");
+        updateDisplay(true);
 
         String deviceId = String((uint32_t)ESP.getEfuseMac(), HEX);
         BackendResponse response = registerDeviceWithBackend(deviceId, savedToken);
@@ -896,6 +1131,8 @@ void setup() {
           savedToken = "";
         } else {
           printError("Ошибка регистрации: " + response.error);
+          setDisplayState(DISPLAY_ERROR, "Backend error", "check server");
+          updateDisplay(true);
         }
       } else if (savedDeviceSecret.length() > 0) {
         printSuccess("Устройство уже зарегистрировано");
@@ -909,9 +1146,15 @@ void setup() {
 
       configMode = false;
       printSuccess("Запуск нормального режима");
+      if (mqttClient.connected()) {
+        setDisplayState(DISPLAY_NORMAL, "", "");
+      }
+      updateDisplay(true);
 
     } else {
       printError("Не удалось подключиться к WiFi");
+      setDisplayState(DISPLAY_ERROR, "WiFi error", "open setup");
+      updateDisplay(true);
       startAccessPoint();
     }
   } else {
@@ -924,6 +1167,7 @@ void loop() {
   if (configMode) {
     dnsServer.processNextRequest();
     server.handleClient();
+    updateDisplay();
 
     if (shouldSaveConfig) {
       printSuccess("Перезагрузка для применения настроек...");
@@ -935,16 +1179,20 @@ void loop() {
     if (WiFi.status() != WL_CONNECTED) {
       printError("Потеряно соединение с WiFi!");
       startAccessPoint();
+      updateDisplay(true);
       return;
     }
 
     // MQTT reconnect
     if (!mqttClient.connected()) {
+      setDisplayState(DISPLAY_MQTT_CONNECTING, "MQTT link", "reconnecting");
       unsigned long now = millis();
       if (now - lastMqttReconnect > MQTT_RECONNECT_INTERVAL) {
         lastMqttReconnect = now;
         connectMqtt();
       }
+    } else if (currentDisplayState != DISPLAY_NORMAL) {
+      setDisplayState(DISPLAY_NORMAL, "", "");
     }
 
     mqttClient.loop();
@@ -961,6 +1209,8 @@ void loop() {
       lastConditionCheck = now2;
       checkConditions();
     }
+
+    updateDisplay();
   }
 
   delay(10);
