@@ -17,6 +17,10 @@ const char* DEFAULT_BACKEND_URL = "http://192.168.0.104:4000";
 const int MQTT_PORT = 1883;
 const unsigned long MQTT_RECONNECT_INTERVAL = 5000;
 const int DHT_PIN = 4; // Board pin label: D4 / GPIO4
+const int SOIL_SENSOR_PINS[2] = {34, 35}; // Board pin labels: D34 / D35
+const int SOIL_DRY_VALUES[2] = {3000, 3000};
+const int SOIL_WET_VALUES[2] = {1300, 1300};
+const int SOIL_SAMPLE_COUNT = 8;
 const unsigned long DHT_READ_INTERVAL = 2500;
 
 DNSServer dnsServer;
@@ -292,6 +296,48 @@ void checkConditions() {
 
 // ===== Sensors (mock) =====
 
+int getSoilSensorIndex(int plantIndex) {
+  if (plantIndex >= 1 && plantIndex <= 2) {
+    return plantIndex - 1;
+  }
+
+  if (plantIndex >= 0 && plantIndex < 2) {
+    return plantIndex;
+  }
+
+  return 0;
+}
+
+int readSoilMoistureRaw(int plantIndex) {
+  int sensorIndex = getSoilSensorIndex(plantIndex);
+  int pin = SOIL_SENSOR_PINS[sensorIndex];
+  long total = 0;
+
+  for (int i = 0; i < SOIL_SAMPLE_COUNT; i++) {
+    total += analogRead(pin);
+    delay(5);
+  }
+
+  return (int)(total / SOIL_SAMPLE_COUNT);
+}
+
+float convertSoilRawToPercent(int rawValue, int plantIndex) {
+  int sensorIndex = getSoilSensorIndex(plantIndex);
+  int dryValue = SOIL_DRY_VALUES[sensorIndex];
+  int wetValue = SOIL_WET_VALUES[sensorIndex];
+
+  if (dryValue == wetValue) {
+    return 0.0f;
+  }
+
+  float percent = ((float)(dryValue - rawValue) * 100.0f) / (float)(dryValue - wetValue);
+
+  if (percent < 0.0f) percent = 0.0f;
+  if (percent > 100.0f) percent = 100.0f;
+
+  return percent;
+}
+
 void updateAirSensorReadings(bool force = false) {
   unsigned long now = millis();
 
@@ -329,7 +375,8 @@ float getAirHumidity(int plantIndex) {
 }
 
 float getSoilMoisture(int plantIndex) {
-  return 10.0 + (float)random(0, 800) / 10.0;
+  int rawValue = readSoilMoistureRaw(plantIndex);
+  return convertSoilRawToPercent(rawValue, plantIndex);
 }
 
 // ===== Command Handlers =====
@@ -489,9 +536,9 @@ void sendTelemetry() {
   for (int i = 0; i < 2; i++) {
     JsonObject plant = plants.createNestedObject();
     plant["index"] = i + 1;
-    plant["temperature"] = getTemperature(i);
-    plant["airHumidity"] = getAirHumidity(i);
-    plant["soilMoisture"] = getSoilMoisture(i);
+    plant["temperature"] = getTemperature(i + 1);
+    plant["airHumidity"] = getAirHumidity(i + 1);
+    plant["soilMoisture"] = getSoilMoisture(i + 1);
   }
 
   String payload;
@@ -794,6 +841,9 @@ void setup() {
   dhtSensor.setup(DHT_PIN, DHTesp::DHT22);
   updateAirSensorReadings(true);
   printSuccess("DHT22 инициализирован на пине D4/GPIO4");
+  pinMode(SOIL_SENSOR_PINS[0], INPUT);
+  pinMode(SOIL_SENSOR_PINS[1], INPUT);
+  printSuccess("Датчики влажности почвы инициализированы на D34 и D35");
 
   registerCommands();
   loadConditionsFromNVS();
