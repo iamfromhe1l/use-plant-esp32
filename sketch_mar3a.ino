@@ -14,8 +14,10 @@ const char* apPassword = NULL;
 const int DNS_PORT = 53;
 const int HTTP_PORT = 80;
 
-const char* DEFAULT_BACKEND_HOST = "192.168.0.104";
-const char* DEFAULT_BACKEND_URL = "http://192.168.0.104:4000";
+const char* LEGACY_BACKEND_HOST = "192.168.0.104";
+const char* LEGACY_BACKEND_URL = "http://192.168.0.104:4000";
+const char* DEFAULT_BACKEND_HOST = "72.56.240.75";
+const char* DEFAULT_BACKEND_URL = "http://72.56.240.75:4000";
 const int MQTT_PORT = 1883;
 const unsigned long MQTT_RECONNECT_INTERVAL = 5000;
 const int DHT_PIN = 4; // Board pin label: D4 / GPIO4
@@ -1086,6 +1088,17 @@ void setup() {
   savedDeviceSecret = preferences.getString("deviceSecret", "");
   savedBackendUrl = preferences.getString("backendUrl", DEFAULT_BACKEND_URL);
   savedMqttServer = preferences.getString("mqttServer", extractHostFromUrl(savedBackendUrl));
+
+  if (savedBackendUrl == LEGACY_BACKEND_URL) {
+    savedBackendUrl = DEFAULT_BACKEND_URL;
+    preferences.putString("backendUrl", savedBackendUrl);
+  }
+
+  if (savedMqttServer.length() == 0 || savedMqttServer == LEGACY_BACKEND_HOST) {
+    savedMqttServer = extractHostFromUrl(savedBackendUrl);
+    preferences.putString("mqttServer", savedMqttServer);
+  }
+
   preferences.end();
 
   if (savedSSID.length() > 0 && savedPassword.length() > 0) {
