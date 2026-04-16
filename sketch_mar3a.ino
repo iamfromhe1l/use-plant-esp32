@@ -255,24 +255,25 @@ void drawCenteredText(int y, const String& text) {
   oled.drawStr(x, y, text.c_str());
 }
 
-void drawMetricCircle(int centerX, int centerY, const char* label, const char* value) {
-  oled.drawCircle(centerX, centerY, 14);
-  oled.drawCircle(centerX, centerY, 15);
-  oled.setFont(u8g2_font_4x6_tf);
-  int labelWidth = oled.getStrWidth(label);
-  oled.drawStr(centerX - (labelWidth / 2), centerY - 4, label);
-  oled.setFont(u8g2_font_6x12_tf);
-  int valueWidth = oled.getStrWidth(value);
-  oled.drawStr(centerX - (valueWidth / 2), centerY + 7, value);
-}
-
-void drawSoilCircle(int centerX, int centerY, const char* label, float moisturePercent) {
+void drawSoilCard(int x, int y, const char* label, float moisturePercent) {
   char valueBuffer[8];
   int value = (int)(moisturePercent + 0.5f);
   if (value < 0) value = 0;
   if (value > 100) value = 100;
   snprintf(valueBuffer, sizeof(valueBuffer), "%d%%", value);
-  drawMetricCircle(centerX, centerY, label, valueBuffer);
+
+  oled.drawRFrame(x, y, 58, 26, 8);
+  oled.setFont(u8g2_font_6x12_tf);
+  oled.drawStr(x + 6, y + 11, label);
+  oled.setFont(u8g2_font_7x13B_tf);
+  oled.drawStr(x + 6, y + 23, valueBuffer);
+
+  int barWidth = 20;
+  int fillWidth = (int)((barWidth * value) / 100.0f);
+  oled.drawRFrame(x + 31, y + 16, barWidth, 6, 3);
+  if (fillWidth > 0) {
+    oled.drawRBox(x + 32, y + 17, fillWidth - (fillWidth == barWidth ? 0 : 1), 4, 2);
+  }
 }
 
 void drawStatusScene(const String& title, const String& subtitle) {
@@ -310,10 +311,18 @@ void drawDashboard() {
   snprintf(airTempBuffer, sizeof(airTempBuffer), "%.1fC", getTemperature(1));
   snprintf(airHumidityBuffer, sizeof(airHumidityBuffer), "%.0f%%", getAirHumidity(1));
 
-  drawSoilCircle(34, 18, "Почва 1", getSoilMoisture(1));
-  drawSoilCircle(94, 18, "Почва 2", getSoilMoisture(2));
-  drawMetricCircle(34, 46, "Воздух", airHumidityBuffer);
-  drawMetricCircle(94, 46, "Темп.", airTempBuffer);
+  oled.setFont(u8g2_font_7x13B_tf);
+  drawCenteredText(14, "usePlant");
+
+  drawSoilCard(4, 22, "Почва 1", getSoilMoisture(1));
+  drawSoilCard(66, 22, "Почва 2", getSoilMoisture(2));
+
+  oled.drawRFrame(4, 50, 120, 12, 6);
+  oled.setFont(u8g2_font_6x12_tf);
+  oled.drawStr(10, 59, airTempBuffer);
+  oled.drawStr(56, 59, airHumidityBuffer);
+  oled.drawDisc(104, 56, 2);
+  oled.drawCircle(112, 56, 3);
 }
 
 void updateDisplay(bool force = false) {
