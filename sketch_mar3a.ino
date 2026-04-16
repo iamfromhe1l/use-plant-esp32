@@ -8,6 +8,7 @@
 #include <DHTesp.h>
 #include <Wire.h>
 #include <U8g2lib.h>
+#include <time.h>
 
 const char* apSSID = "PlantWatering-ESP32";
 const char* apPassword = NULL;
@@ -20,6 +21,7 @@ const char* DEFAULT_BACKEND_HOST = "72.56.240.75";
 const char* DEFAULT_BACKEND_URL = "http://72.56.240.75:4000";
 const int MQTT_PORT = 1883;
 const unsigned long MQTT_RECONNECT_INTERVAL = 5000;
+const int DEFAULT_TELEMETRY_INTERVAL_MINUTES = 5;
 const int DHT_PIN = 4; // Board pin label: D4 / GPIO4
 const int SOIL_SENSOR_PINS[2] = {34, 35}; // Board pin labels: D34 / D35
 const int SOIL_DRY_VALUES[2] = {3000, 3000};
@@ -31,6 +33,10 @@ const int DISPLAY_SCL_PIN = 22; // Board pin label: D22 / GPIO22
 const unsigned long DISPLAY_REFRESH_INTERVAL = 120;
 const unsigned long SOIL_READ_INTERVAL = 1500;
 const unsigned long WATERING_ANIMATION_DURATION = 5000;
+const long GMT_OFFSET_SEC = 3 * 3600;
+const int DAYLIGHT_OFFSET_SEC = 0;
+const char* NTP_SERVER_1 = "pool.ntp.org";
+const char* NTP_SERVER_2 = "time.google.com";
 
 DNSServer dnsServer;
 WebServer server(HTTP_PORT);
@@ -51,7 +57,7 @@ bool shouldSaveConfig = false;
 bool configMode = false;
 unsigned long lastMqttReconnect = 0;
 unsigned long lastTelemetrySend = 0;
-const unsigned long TELEMETRY_INTERVAL = 60000; // 1 минута
+unsigned long telemetryIntervalMs = (unsigned long)DEFAULT_TELEMETRY_INTERVAL_MINUTES * 60000UL;
 unsigned long lastDhtRead = 0;
 unsigned long lastDhtErrorLog = 0;
 float lastAirTemperature = 22.0f;
@@ -89,8 +95,9 @@ struct SensorRule {
 };
 
 struct Schedule {
-  int hour;
-  int minute;
+  int hours[6];
+  int minutes[6];
+  int timeCount;
   bool days[7]; // 0=Sun .. 6=Sat
 };
 
@@ -104,6 +111,7 @@ struct WateringCondition {
   Schedule schedule;
   bool enabled;
   unsigned long lastTriggered; // millis when last watered
+  long lastScheduleTriggerKey;
 };
 
 struct BackendResponse {
@@ -133,6 +141,95 @@ String extractHostFromUrl(const String& url) {
   return host;
 }
 
+void setupClock() {
+  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER_1, NTP_SERVER_2);
+}
+
+bool getCurrentLocalTimeInfo(struct tm* timeinfo) {
+  return getLocalTime(timeinfo, 1000);
+}
+
+long buildScheduleTriggerKey(const struct tm& timeinfo, int hour, int minute) {
+  return (long)timeinfo.tm_yday * 10000L + (long)hour * 100L + minute;
+}
+
+void resetSchedule(Schedule& schedule) {
+  memset(schedule.hours, 0, sizeof(schedule.hours));
+  memset(schedule.minutes, 0, sizeof(schedule.minutes));
+  schedule.timeCount = 0;
+  memset(schedule.days, 0, sizeof(schedule.days));
+}
+
+bool parseScheduleTime(const String& timeStr, int& hour, int& minute) {
+  if (timeStr.length() != 5 || timeStr.charAt(2) != ':') {
+    return false;
+  }
+
+  hour = timeStr.substring(0, 2).toInt();
+  minute = timeStr.substring(3).toInt();
+
+  return hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59;
+}
+
+void addScheduleTime(Schedule& schedule, const String& timeStr) {
+  if (schedule.timeCount >= 6) {
+    return;
+  }
+
+  int hour = 0;
+  int minute = 0;
+  if (!parseScheduleTime(timeStr, hour, minute)) {
+    return;
+  }
+
+  for (int i = 0; i < schedule.timeCount; i++) {
+    if (schedule.hours[i] == hour && schedule.minutes[i] == minute) {
+      return;
+    }
+  }
+
+  schedule.hours[schedule.timeCount] = hour;
+  schedule.minutes[schedule.timeCount] = minute;
+  schedule.timeCount++;
+}
+
+void loadScheduleFromJson(JsonObjectConst sched, Schedule& schedule) {
+  resetSchedule(schedule);
+
+  if (sched.containsKey("times")) {
+    JsonArrayConst times = sched["times"].as<JsonArrayConst>();
+    for (JsonVariantConst value : times) {
+      addScheduleTime(schedule, value.as<const char*>());
+    }
+  }
+
+  if (schedule.timeCount == 0 && sched.containsKey("time")) {
+    addScheduleTime(schedule, sched["time"].as<const char*>());
+  }
+
+  if (schedule.timeCount == 0) {
+    addScheduleTime(schedule, "08:00");
+  }
+
+  bool hasAnyDay = false;
+  if (sched.containsKey("days")) {
+    JsonArrayConst days = sched["days"].as<JsonArrayConst>();
+    for (JsonVariantConst value : days) {
+      int d = value.as<int>();
+      if (d >= 0 && d < 7) {
+        schedule.days[d] = true;
+        hasAnyDay = true;
+      }
+    }
+  }
+
+  if (!hasAnyDay) {
+    for (int d = 0; d < 7; d++) {
+      schedule.days[d] = true;
+    }
+  }
+}
+
 void setDisplayState(DisplayState state, const String& primary = "", const String& secondary = "") {
   currentDisplayState = state;
 
@@ -158,108 +255,65 @@ void drawCenteredText(int y, const String& text) {
   oled.drawStr(x, y, text.c_str());
 }
 
-void drawChip(int x, int y, const char* label, bool active) {
-  int width = oled.getStrWidth(label) + 12;
-
-  if (active) {
-    oled.drawRBox(x, y, width, 14, 6);
-    oled.setDrawColor(0);
-    oled.drawStr(x + 6, y + 10, label);
-    oled.setDrawColor(1);
-  } else {
-    oled.drawRFrame(x, y, width, 14, 6);
-    oled.drawStr(x + 6, y + 10, label);
-  }
+void drawMetricCircle(int centerX, int centerY, const char* label, const char* value) {
+  oled.drawCircle(centerX, centerY, 14);
+  oled.drawCircle(centerX, centerY, 15);
+  oled.setFont(u8g2_font_4x6_tf);
+  int labelWidth = oled.getStrWidth(label);
+  oled.drawStr(centerX - (labelWidth / 2), centerY - 4, label);
+  oled.setFont(u8g2_font_6x12_tf);
+  int valueWidth = oled.getStrWidth(value);
+  oled.drawStr(centerX - (valueWidth / 2), centerY + 7, value);
 }
 
-void drawSoilCard(int x, int y, const char* label, float moisturePercent) {
+void drawSoilCircle(int centerX, int centerY, const char* label, float moisturePercent) {
   char valueBuffer[8];
   int value = (int)(moisturePercent + 0.5f);
   if (value < 0) value = 0;
   if (value > 100) value = 100;
   snprintf(valueBuffer, sizeof(valueBuffer), "%d%%", value);
-
-  oled.drawRFrame(x, y, 58, 26, 8);
-  oled.setFont(u8g2_font_6x12_tf);
-  oled.drawStr(x + 6, y + 11, label);
-  oled.setFont(u8g2_font_7x13B_tf);
-  oled.drawStr(x + 6, y + 23, valueBuffer);
-
-  int barWidth = 20;
-  int fillWidth = (int)((barWidth * value) / 100.0f);
-  oled.drawRFrame(x + 31, y + 16, barWidth, 6, 3);
-  if (fillWidth > 0) {
-    oled.drawRBox(x + 32, y + 17, fillWidth - (fillWidth == barWidth ? 0 : 1), 4, 2);
-  }
+  drawMetricCircle(centerX, centerY, label, valueBuffer);
 }
 
-void drawStatusScene(const String& title, const String& subtitle, unsigned long frame) {
-  int dotCount = (int)((frame / 10) % 4) + 1;
-  String loadingDots = "";
-  for (int i = 0; i < dotCount; i++) {
-    loadingDots += ".";
-  }
-
+void drawStatusScene(const String& title, const String& subtitle) {
   oled.drawRFrame(6, 6, 116, 52, 10);
   oled.drawRFrame(14, 14, 100, 36, 8);
-  oled.drawDisc(24 + (int)((frame / 3) % 14), 22, 2);
-  oled.drawDisc(100 - (int)((frame / 4) % 12), 42, 1);
-
   oled.setFont(u8g2_font_7x13B_tf);
   drawCenteredText(27, title);
   oled.setFont(u8g2_font_6x12_tf);
   drawCenteredText(40, subtitle);
-  drawCenteredText(53, loadingDots);
 }
 
-void drawWateringScene(unsigned long frame) {
-  char plantBuffer[16];
-  char levelBuffer[16];
-  int pulse = (int)((frame / 2) % 10);
+void drawWateringScene() {
+  char plantBuffer[20];
+  char levelBuffer[20];
 
-  snprintf(plantBuffer, sizeof(plantBuffer), "Plant %d", wateringAnimationPlant);
-  snprintf(levelBuffer, sizeof(levelBuffer), "Level %d", wateringAnimationLevel);
+  snprintf(plantBuffer, sizeof(plantBuffer), "Растение %d", wateringAnimationPlant);
+  snprintf(levelBuffer, sizeof(levelBuffer), "Полив %d/10", wateringAnimationLevel);
 
   oled.drawRFrame(2, 2, 124, 60, 12);
   oled.drawRFrame(8, 8, 112, 48, 10);
 
   oled.setFont(u8g2_font_7x13B_tf);
-  drawCenteredText(18, "WATERING");
+  drawCenteredText(18, "Полив");
   oled.setFont(u8g2_font_6x12_tf);
   drawCenteredText(31, plantBuffer);
   drawCenteredText(42, levelBuffer);
-
-  for (int i = 0; i < 4; i++) {
-    int baseX = 26 + i * 24;
-    int y = 48 + ((frame + i * 3) % 9) - 4;
-    oled.drawDisc(baseX, y, 2 + ((pulse + i) % 3));
-  }
-
-  oled.drawEllipse(64, 56, 28 + (pulse / 2), 5);
+  oled.drawRFrame(28, 47, 72, 8, 4);
+  oled.drawRBox(30, 49, 48, 4, 2);
 }
 
 void drawDashboard() {
-  char airBuffer[20];
-  char humidityBuffer[16];
+  char airTempBuffer[12];
+  char airHumidityBuffer[12];
 
-  oled.setFont(u8g2_font_6x12_tf);
-  drawChip(4, 4, "WiFi", WiFi.status() == WL_CONNECTED);
-  drawChip(50, 4, "MQTT", mqttClient.connected());
-  oled.drawRFrame(94, 4, 30, 14, 6);
-  oled.drawStr(100, 14, "AIR");
+  snprintf(airTempBuffer, sizeof(airTempBuffer), "%.1fC", getTemperature(1));
+  snprintf(airHumidityBuffer, sizeof(airHumidityBuffer), "%.0f%%", getAirHumidity(1));
 
-  drawSoilCard(4, 22, "P1", getSoilMoisture(1));
-  drawSoilCard(66, 22, "P2", getSoilMoisture(2));
-
-  snprintf(airBuffer, sizeof(airBuffer), "%.1fC", getTemperature(1));
-  snprintf(humidityBuffer, sizeof(humidityBuffer), "%.0f%%", getAirHumidity(1));
-
-  oled.drawRFrame(4, 50, 120, 12, 6);
-  oled.setFont(u8g2_font_6x12_tf);
-  oled.drawStr(10, 59, airBuffer);
-  oled.drawStr(56, 59, humidityBuffer);
-  oled.drawDisc(104, 56, 2);
-  oled.drawCircle(112, 56, 3);
+  drawSoilCircle(34, 18, "Почва 1", getSoilMoisture(1));
+  drawSoilCircle(94, 18, "Почва 2", getSoilMoisture(2));
+  drawMetricCircle(34, 46, "Воздух", airHumidityBuffer);
+  drawMetricCircle(94, 46, "Темп.", airTempBuffer);
 }
 
 void updateDisplay(bool force = false) {
@@ -274,7 +328,7 @@ void updateDisplay(bool force = false) {
   oled.clearBuffer();
 
   if (wateringAnimationUntil > now) {
-    drawWateringScene(now / 60);
+    drawWateringScene();
   } else {
     switch (currentDisplayState) {
       case DISPLAY_BOOT:
@@ -283,7 +337,7 @@ void updateDisplay(bool force = false) {
       case DISPLAY_REGISTERING:
       case DISPLAY_MQTT_CONNECTING:
       case DISPLAY_ERROR:
-        drawStatusScene(displayPrimaryText, displaySecondaryText, now / 80);
+        drawStatusScene(displayPrimaryText, displaySecondaryText);
         break;
       case DISPLAY_NORMAL:
       default:
@@ -326,7 +380,7 @@ unsigned long lastConditionCheck = 0;
 const unsigned long CONDITION_CHECK_INTERVAL = 10000; // check every 10 seconds
 
 void saveConditionsToNVS() {
-  StaticJsonDocument<2048> doc;
+  StaticJsonDocument<4096> doc;
   JsonArray arr = doc.to<JsonArray>();
 
   for (int i = 0; i < conditionCount; i++) {
@@ -337,7 +391,7 @@ void saveConditionsToNVS() {
     obj["interval"] = waterConditions[i].interval;
     obj["enabled"] = waterConditions[i].enabled;
 
-    if (strcmp(waterConditions[i].type, "sensor") == 0) {
+    if (waterConditions[i].ruleCount > 0) {
       JsonArray rules = obj.createNestedArray("rules");
       for (int j = 0; j < waterConditions[i].ruleCount; j++) {
         JsonObject rule = rules.createNestedObject();
@@ -345,11 +399,33 @@ void saveConditionsToNVS() {
         rule["operator"] = waterConditions[i].rules[j].op;
         rule["value"] = waterConditions[i].rules[j].value;
       }
-    } else {
+    }
+
+    if (strcmp(waterConditions[i].type, "schedule") == 0) {
       JsonObject sched = obj.createNestedObject("schedule");
-      sched["time"] = String(waterConditions[i].schedule.hour) + ":" +
-                      (waterConditions[i].schedule.minute < 10 ? "0" : "") +
-                      String(waterConditions[i].schedule.minute);
+      JsonArray times = sched.createNestedArray("times");
+      for (int t = 0; t < waterConditions[i].schedule.timeCount; t++) {
+        char timeBuffer[6];
+        snprintf(
+          timeBuffer,
+          sizeof(timeBuffer),
+          "%02d:%02d",
+          waterConditions[i].schedule.hours[t],
+          waterConditions[i].schedule.minutes[t]
+        );
+        times.add(timeBuffer);
+      }
+      if (waterConditions[i].schedule.timeCount > 0) {
+        char primaryTime[6];
+        snprintf(
+          primaryTime,
+          sizeof(primaryTime),
+          "%02d:%02d",
+          waterConditions[i].schedule.hours[0],
+          waterConditions[i].schedule.minutes[0]
+        );
+        sched["time"] = primaryTime;
+      }
       JsonArray days = sched.createNestedArray("days");
       for (int d = 0; d < 7; d++) {
         if (waterConditions[i].schedule.days[d]) days.add(d);
@@ -372,7 +448,7 @@ void loadConditionsFromNVS() {
   String json = preferences.getString("data", "[]");
   preferences.end();
 
-  StaticJsonDocument<2048> doc;
+  StaticJsonDocument<4096> doc;
   DeserializationError error = deserializeJson(doc, json);
   if (error) {
     printError("Ошибка загрузки условий: " + String(error.c_str()));
@@ -392,9 +468,12 @@ void loadConditionsFromNVS() {
     c.interval = obj["interval"] | 60;
     c.enabled = obj["enabled"] | true;
     c.lastTriggered = 0;
+    c.lastScheduleTriggerKey = -1;
     c.ruleCount = 0;
 
-    if (strcmp(c.type, "sensor") == 0 && obj.containsKey("rules")) {
+    resetSchedule(c.schedule);
+
+    if (obj.containsKey("rules")) {
       JsonArray rules = obj["rules"].as<JsonArray>();
       for (JsonObject rule : rules) {
         if (c.ruleCount >= 4) break;
@@ -403,17 +482,11 @@ void loadConditionsFromNVS() {
         c.rules[c.ruleCount].value = rule["value"] | 0.0f;
         c.ruleCount++;
       }
-    } else if (strcmp(c.type, "schedule") == 0 && obj.containsKey("schedule")) {
+    }
+
+    if (strcmp(c.type, "schedule") == 0 && obj.containsKey("schedule")) {
       JsonObject sched = obj["schedule"].as<JsonObject>();
-      String timeStr = sched["time"] | "08:00";
-      int colonIdx = timeStr.indexOf(':');
-      c.schedule.hour = timeStr.substring(0, colonIdx).toInt();
-      c.schedule.minute = timeStr.substring(colonIdx + 1).toInt();
-      memset(c.schedule.days, 0, sizeof(c.schedule.days));
-      JsonArray days = sched["days"].as<JsonArray>();
-      for (int d : days) {
-        if (d >= 0 && d < 7) c.schedule.days[d] = true;
-      }
+      loadScheduleFromJson(sched, c.schedule);
     }
 
     conditionCount++;
@@ -437,17 +510,53 @@ bool evaluateRule(const SensorRule& rule, int plantIndex) {
   return false;
 }
 
-void triggerWatering(int plantIndex, int level) {
-  startWateringAnimation(plantIndex, level);
-  if (plantIndex == 1) {
-    printSuccess("[MOCK] Авто-полив растения 1, уровень: " + String(level));
-  } else {
-    printSuccess("[MOCK] Авто-полив растения 2, уровень: " + String(level));
+void publishWateringEvent(int plantIndex, int level, const char* source) {
+  if (!mqttClient.connected()) {
+    printWarning("Полив выполнен, но MQTT недоступен: событие не отправлено");
+    return;
   }
+
+  String deviceId = String((uint32_t)ESP.getEfuseMac(), HEX);
+  String topic = "devices/" + deviceId + "/watering";
+
+  StaticJsonDocument<256> doc;
+  doc["deviceId"] = deviceId;
+  doc["plantIndex"] = plantIndex;
+  doc["level"] = level;
+  doc["source"] = source;
+  doc["timestamp"] = millis();
+
+  String payload;
+  serializeJson(doc, payload);
+  mqttClient.publish(topic.c_str(), payload.c_str());
+}
+
+void performWatering(int plantIndex, int level, const char* source) {
+  startWateringAnimation(plantIndex, level);
+  publishWateringEvent(plantIndex, level, source);
+
+  String sourceLabel = "manual";
+  if (strcmp(source, "condition_sensor") == 0) {
+    sourceLabel = "auto:sensor";
+  } else if (strcmp(source, "condition_schedule") == 0) {
+    sourceLabel = "auto:schedule";
+  }
+
+  printSuccess(
+    String("[MOCK] Полив растения ") + String(plantIndex) +
+    ", уровень: " + String(level) +
+    ", источник: " + sourceLabel
+  );
+}
+
+void triggerWatering(int plantIndex, int level) {
+  performWatering(plantIndex, level, "condition_sensor");
 }
 
 void checkConditions() {
   unsigned long now = millis();
+  struct tm timeinfo;
+  bool hasLocalTime = getCurrentLocalTimeInfo(&timeinfo);
 
   for (int i = 0; i < conditionCount; i++) {
     WateringCondition& c = waterConditions[i];
@@ -474,17 +583,45 @@ void checkConditions() {
         c.lastTriggered = now;
       }
     } else if (strcmp(c.type, "schedule") == 0) {
-      // For schedule, we use millis-based rough time tracking
-      // In a real implementation, use NTP or RTC
-      // For now, check if we haven't triggered in the last interval
-      if (c.lastTriggered > 0 && (now - c.lastTriggered) < 60000UL) {
-        continue; // Don't trigger more than once per minute
+      if (!hasLocalTime) {
+        continue;
       }
 
-      // Without RTC, schedule conditions trigger based on stored time
-      // This is a simplified version - with NTP sync it would check actual time
-      // For MVP: just log that schedule would trigger
-      // TODO: Add NTP time sync for accurate schedule checking
+      if (!c.schedule.days[timeinfo.tm_wday]) {
+        continue;
+      }
+
+      bool rulesMatch = true;
+      for (int j = 0; j < c.ruleCount; j++) {
+        if (!evaluateRule(c.rules[j], c.plantIndex)) {
+          rulesMatch = false;
+          break;
+        }
+      }
+
+      if (!rulesMatch) {
+        continue;
+      }
+
+      for (int t = 0; t < c.schedule.timeCount; t++) {
+        int scheduledHour = c.schedule.hours[t];
+        int scheduledMinute = c.schedule.minutes[t];
+
+        if (timeinfo.tm_hour != scheduledHour || timeinfo.tm_min != scheduledMinute) {
+          continue;
+        }
+
+        long triggerKey = buildScheduleTriggerKey(timeinfo, scheduledHour, scheduledMinute);
+        if (c.lastScheduleTriggerKey == triggerKey) {
+          continue;
+        }
+
+        printDebug("Условие #" + String(i) + " сработало (расписание)");
+        performWatering(c.plantIndex, c.level, "condition_schedule");
+        c.lastTriggered = now;
+        c.lastScheduleTriggerKey = triggerKey;
+        break;
+      }
     }
   }
 }
@@ -625,16 +762,28 @@ void handleCmd_waterPlant1(JsonObject& payload) {
   int level = payload["level"] | 5;
   if (level < 1) level = 1;
   if (level > 10) level = 10;
-  startWateringAnimation(1, level);
-  printSuccess("[MOCK] Полив растения 1, уровень: " + String(level));
+  performWatering(1, level, "manual");
 }
 
 void handleCmd_waterPlant2(JsonObject& payload) {
   int level = payload["level"] | 5;
   if (level < 1) level = 1;
   if (level > 10) level = 10;
-  startWateringAnimation(2, level);
-  printSuccess("[MOCK] Полив растения 2, уровень: " + String(level));
+  performWatering(2, level, "manual");
+}
+
+void handleCmd_setTelemetryInterval(JsonObject& payload) {
+  int minutes = payload["minutes"] | DEFAULT_TELEMETRY_INTERVAL_MINUTES;
+  if (minutes < 5) minutes = 5;
+  if (minutes > 60) minutes = 60;
+
+  telemetryIntervalMs = (unsigned long)minutes * 60000UL;
+
+  preferences.begin("wifi", false);
+  preferences.putUInt("telemetryMin", minutes);
+  preferences.end();
+
+  printSuccess("Интервал телеметрии обновлен: " + String(minutes) + " мин");
 }
 
 void handleCmd_setConditions(JsonObject& payload) {
@@ -656,9 +805,12 @@ void handleCmd_setConditions(JsonObject& payload) {
     c.interval = obj["interval"] | 60;
     c.enabled = obj["enabled"] | true;
     c.lastTriggered = 0;
+    c.lastScheduleTriggerKey = -1;
     c.ruleCount = 0;
 
-    if (strcmp(c.type, "sensor") == 0 && obj.containsKey("rules")) {
+    resetSchedule(c.schedule);
+
+    if (obj.containsKey("rules")) {
       JsonArray rules = obj["rules"].as<JsonArray>();
       for (JsonObject rule : rules) {
         if (c.ruleCount >= 4) break;
@@ -667,17 +819,11 @@ void handleCmd_setConditions(JsonObject& payload) {
         c.rules[c.ruleCount].value = rule["value"] | 0.0f;
         c.ruleCount++;
       }
-    } else if (strcmp(c.type, "schedule") == 0 && obj.containsKey("schedule")) {
+    }
+
+    if (strcmp(c.type, "schedule") == 0 && obj.containsKey("schedule")) {
       JsonObject sched = obj["schedule"].as<JsonObject>();
-      String timeStr = sched["time"] | "08:00";
-      int colonIdx = timeStr.indexOf(':');
-      c.schedule.hour = timeStr.substring(0, colonIdx).toInt();
-      c.schedule.minute = timeStr.substring(colonIdx + 1).toInt();
-      memset(c.schedule.days, 0, sizeof(c.schedule.days));
-      JsonArray days = sched["days"].as<JsonArray>();
-      for (int d : days) {
-        if (d >= 0 && d < 7) c.schedule.days[d] = true;
-      }
+      loadScheduleFromJson(sched, c.schedule);
     }
 
     conditionCount++;
@@ -702,6 +848,7 @@ void handleCmd_deviceReset(JsonObject& payload) {
 void registerCommands() {
   registerCommand("water_plant_1", handleCmd_waterPlant1);
   registerCommand("water_plant_2", handleCmd_waterPlant2);
+  registerCommand("set_telemetry_interval", handleCmd_setTelemetryInterval);
   registerCommand("device_reset", handleCmd_deviceReset);
   registerCommand("set_conditions", handleCmd_setConditions);
 }
@@ -779,7 +926,7 @@ void connectMqtt() {
   String commandsTopic = "devices/" + deviceId + "/commands";
 
   printDebug("Подключение к MQTT: " + savedMqttServer);
-  setDisplayState(DISPLAY_MQTT_CONNECTING, "MQTT link", "connecting");
+  setDisplayState(DISPLAY_MQTT_CONNECTING, "Подключение", "восстанавливаем связь");
 
   if (mqttClient.connect(clientId.c_str())) {
     printSuccess("MQTT подключен!");
@@ -928,7 +1075,7 @@ void startAccessPoint() {
 
   IPAddress apIP = WiFi.softAPIP();
   printSuccess("IP точки доступа: " + apIP.toString());
-  setDisplayState(DISPLAY_WIFI_SETUP, "WiFi setup", apSSID);
+  setDisplayState(DISPLAY_WIFI_SETUP, "Режим настройки", "откройте сеть устройства");
 
   dnsServer.start(DNS_PORT, "*", apIP);
 
@@ -1057,7 +1204,7 @@ void setup() {
   Wire.begin(DISPLAY_SDA_PIN, DISPLAY_SCL_PIN);
   oled.begin();
   oled.setContrast(180);
-  setDisplayState(DISPLAY_BOOT, "usePlant", "starting");
+  setDisplayState(DISPLAY_BOOT, "usePlant", "запуск");
   updateDisplay(true);
 
   Serial.println();
@@ -1088,6 +1235,8 @@ void setup() {
   savedDeviceSecret = preferences.getString("deviceSecret", "");
   savedBackendUrl = preferences.getString("backendUrl", DEFAULT_BACKEND_URL);
   savedMqttServer = preferences.getString("mqttServer", extractHostFromUrl(savedBackendUrl));
+  unsigned int savedTelemetryIntervalMinutes =
+    preferences.getUInt("telemetryMin", DEFAULT_TELEMETRY_INTERVAL_MINUTES);
 
   if (savedBackendUrl == LEGACY_BACKEND_URL) {
     savedBackendUrl = DEFAULT_BACKEND_URL;
@@ -1100,10 +1249,14 @@ void setup() {
   }
 
   preferences.end();
+  if (savedTelemetryIntervalMinutes < 5) savedTelemetryIntervalMinutes = 5;
+  if (savedTelemetryIntervalMinutes > 60) savedTelemetryIntervalMinutes = 60;
+  telemetryIntervalMs = (unsigned long)savedTelemetryIntervalMinutes * 60000UL;
+  printSuccess("Интервал телеметрии: " + String(savedTelemetryIntervalMinutes) + " мин");
 
   if (savedSSID.length() > 0 && savedPassword.length() > 0) {
     printDebug("Попытка подключения к WiFi: " + savedSSID);
-    setDisplayState(DISPLAY_WIFI_CONNECTING, "Joining WiFi", savedSSID);
+    setDisplayState(DISPLAY_WIFI_CONNECTING, "Подключение", savedSSID);
     updateDisplay(true);
 
     WiFi.mode(WIFI_STA);
@@ -1121,11 +1274,13 @@ void setup() {
     if (WiFi.status() == WL_CONNECTED) {
       printSuccess("Подключено к WiFi!");
       printDebug("IP адрес: " + WiFi.localIP().toString());
+      setupClock();
+      printSuccess("NTP-синхронизация времени запрошена");
 
       // Если есть токен, но нет deviceSecret - регистрируемся
       if (savedToken.length() > 0 && savedDeviceSecret.length() == 0) {
         printDebug("Устройство не зарегистрировано. Регистрация на бэкенде...");
-        setDisplayState(DISPLAY_REGISTERING, "Cloud link", "registering");
+        setDisplayState(DISPLAY_REGISTERING, "Подготовка", "сохраняем данные");
         updateDisplay(true);
 
         String deviceId = String((uint32_t)ESP.getEfuseMac(), HEX);
@@ -1144,7 +1299,7 @@ void setup() {
           savedToken = "";
         } else {
           printError("Ошибка регистрации: " + response.error);
-          setDisplayState(DISPLAY_ERROR, "Backend error", "check server");
+          setDisplayState(DISPLAY_ERROR, "Ошибка", "проверьте приложение");
           updateDisplay(true);
         }
       } else if (savedDeviceSecret.length() > 0) {
@@ -1166,7 +1321,7 @@ void setup() {
 
     } else {
       printError("Не удалось подключиться к WiFi");
-      setDisplayState(DISPLAY_ERROR, "WiFi error", "open setup");
+      setDisplayState(DISPLAY_ERROR, "Нет связи", "откройте настройку");
       updateDisplay(true);
       startAccessPoint();
     }
@@ -1198,7 +1353,7 @@ void loop() {
 
     // MQTT reconnect
     if (!mqttClient.connected()) {
-      setDisplayState(DISPLAY_MQTT_CONNECTING, "MQTT link", "reconnecting");
+      setDisplayState(DISPLAY_MQTT_CONNECTING, "Подключение", "восстанавливаем связь");
       unsigned long now = millis();
       if (now - lastMqttReconnect > MQTT_RECONNECT_INTERVAL) {
         lastMqttReconnect = now;
@@ -1210,9 +1365,9 @@ void loop() {
 
     mqttClient.loop();
 
-    // Отправка телеметрии каждые 5 секунд
+    // Отправка телеметрии по настроенному интервалу
     unsigned long now2 = millis();
-    if (now2 - lastTelemetrySend > TELEMETRY_INTERVAL) {
+    if (now2 - lastTelemetrySend > telemetryIntervalMs) {
       lastTelemetrySend = now2;
       sendTelemetry();
     }
