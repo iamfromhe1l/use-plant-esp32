@@ -289,14 +289,14 @@ void drawWateringScene() {
   char plantBuffer[20];
   char levelBuffer[20];
 
-  snprintf(plantBuffer, sizeof(plantBuffer), "Растение %d", wateringAnimationPlant);
-  snprintf(levelBuffer, sizeof(levelBuffer), "Полив %d/10", wateringAnimationLevel);
+  snprintf(plantBuffer, sizeof(plantBuffer), "Plant %d", wateringAnimationPlant);
+  snprintf(levelBuffer, sizeof(levelBuffer), "Level %d/10", wateringAnimationLevel);
 
   oled.drawRFrame(2, 2, 124, 60, 12);
   oled.drawRFrame(8, 8, 112, 48, 10);
 
   oled.setFont(u8g2_font_7x13B_tf);
-  drawCenteredText(18, "Полив");
+  drawCenteredText(18, "WATERING");
   oled.setFont(u8g2_font_6x12_tf);
   drawCenteredText(31, plantBuffer);
   drawCenteredText(42, levelBuffer);
@@ -314,8 +314,8 @@ void drawDashboard() {
   oled.setFont(u8g2_font_7x13B_tf);
   drawCenteredText(14, "usePlant");
 
-  drawSoilCard(4, 22, "Почва 1", getSoilMoisture(1));
-  drawSoilCard(66, 22, "Почва 2", getSoilMoisture(2));
+  drawSoilCard(4, 22, "SOIL 1", getSoilMoisture(1));
+  drawSoilCard(66, 22, "SOIL 2", getSoilMoisture(2));
 
   oled.drawRFrame(4, 50, 120, 12, 6);
   oled.setFont(u8g2_font_6x12_tf);
@@ -935,7 +935,7 @@ void connectMqtt() {
   String commandsTopic = "devices/" + deviceId + "/commands";
 
   printDebug("Подключение к MQTT: " + savedMqttServer);
-  setDisplayState(DISPLAY_MQTT_CONNECTING, "Подключение", "восстанавливаем связь");
+  setDisplayState(DISPLAY_MQTT_CONNECTING, "Connecting", "restoring link");
 
   if (mqttClient.connect(clientId.c_str())) {
     printSuccess("MQTT подключен!");
@@ -1084,7 +1084,7 @@ void startAccessPoint() {
 
   IPAddress apIP = WiFi.softAPIP();
   printSuccess("IP точки доступа: " + apIP.toString());
-  setDisplayState(DISPLAY_WIFI_SETUP, "Режим настройки", "откройте сеть устройства");
+  setDisplayState(DISPLAY_WIFI_SETUP, "Setup mode", "open device network");
 
   dnsServer.start(DNS_PORT, "*", apIP);
 
@@ -1213,7 +1213,7 @@ void setup() {
   Wire.begin(DISPLAY_SDA_PIN, DISPLAY_SCL_PIN);
   oled.begin();
   oled.setContrast(180);
-  setDisplayState(DISPLAY_BOOT, "usePlant", "запуск");
+  setDisplayState(DISPLAY_BOOT, "usePlant", "starting");
   updateDisplay(true);
 
   Serial.println();
@@ -1265,7 +1265,7 @@ void setup() {
 
   if (savedSSID.length() > 0 && savedPassword.length() > 0) {
     printDebug("Попытка подключения к WiFi: " + savedSSID);
-    setDisplayState(DISPLAY_WIFI_CONNECTING, "Подключение", savedSSID);
+    setDisplayState(DISPLAY_WIFI_CONNECTING, "Connecting", savedSSID);
     updateDisplay(true);
 
     WiFi.mode(WIFI_STA);
@@ -1289,7 +1289,7 @@ void setup() {
       // Если есть токен, но нет deviceSecret - регистрируемся
       if (savedToken.length() > 0 && savedDeviceSecret.length() == 0) {
         printDebug("Устройство не зарегистрировано. Регистрация на бэкенде...");
-        setDisplayState(DISPLAY_REGISTERING, "Подготовка", "сохраняем данные");
+        setDisplayState(DISPLAY_REGISTERING, "Preparing", "saving setup");
         updateDisplay(true);
 
         String deviceId = String((uint32_t)ESP.getEfuseMac(), HEX);
@@ -1308,7 +1308,7 @@ void setup() {
           savedToken = "";
         } else {
           printError("Ошибка регистрации: " + response.error);
-          setDisplayState(DISPLAY_ERROR, "Ошибка", "проверьте приложение");
+          setDisplayState(DISPLAY_ERROR, "Error", "check app");
           updateDisplay(true);
         }
       } else if (savedDeviceSecret.length() > 0) {
@@ -1330,7 +1330,7 @@ void setup() {
 
     } else {
       printError("Не удалось подключиться к WiFi");
-      setDisplayState(DISPLAY_ERROR, "Нет связи", "откройте настройку");
+      setDisplayState(DISPLAY_ERROR, "Offline", "open setup");
       updateDisplay(true);
       startAccessPoint();
     }
@@ -1362,7 +1362,7 @@ void loop() {
 
     // MQTT reconnect
     if (!mqttClient.connected()) {
-      setDisplayState(DISPLAY_MQTT_CONNECTING, "Подключение", "восстанавливаем связь");
+      setDisplayState(DISPLAY_MQTT_CONNECTING, "Connecting", "restoring link");
       unsigned long now = millis();
       if (now - lastMqttReconnect > MQTT_RECONNECT_INTERVAL) {
         lastMqttReconnect = now;
