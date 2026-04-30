@@ -34,7 +34,7 @@ const unsigned long DISPLAY_REFRESH_INTERVAL = 120;
 const unsigned long SOIL_READ_INTERVAL = 1500;
 const unsigned long WATERING_ANIMATION_DURATION = 5000;
 const int PUMP_PINS[2] = {26, 27}; // Board pin labels: D26 / D27
-const bool PUMP_ENABLED[2] = {true, false};
+const bool PUMP_ENABLED[2] = {true, true};
 const unsigned long WATERING_MIN_DURATION_MS = 300;
 const unsigned long WATERING_STEP_DURATION_MS = 300;
 const long GMT_OFFSET_SEC = 3 * 3600;
@@ -1291,7 +1291,7 @@ void setup() {
   digitalWrite(PUMP_PINS[1], LOW);
   updateSoilReadings(true);
   printSuccess("Датчики влажности почвы инициализированы на D34 и D35");
-  printSuccess("Насос 1 активирован на D26, насос 2 пока отключен");
+  printSuccess("Насос 1 активирован на D26, насос 2 активирован на D27");
   printSuccess("OLED инициализирован на D21/D22 (I2C)");
   updateDisplay(true);
 
