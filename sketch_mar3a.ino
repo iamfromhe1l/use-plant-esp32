@@ -33,6 +33,10 @@ const int DISPLAY_SCL_PIN = 22; // Board pin label: D22 / GPIO22
 const unsigned long DISPLAY_REFRESH_INTERVAL = 120;
 const unsigned long SOIL_READ_INTERVAL = 1500;
 const unsigned long WATERING_ANIMATION_DURATION = 5000;
+const int PUMP_PINS[2] = {26, 27}; // Board pin labels: D26 / D27
+const bool PUMP_ENABLED[2] = {true, false};
+const unsigned long WATERING_MIN_DURATION_MS = 300;
+const unsigned long WATERING_STEP_DURATION_MS = 300;
 const long GMT_OFFSET_SEC = 3 * 3600;
 const int DAYLIGHT_OFFSET_SEC = 0;
 const char* NTP_SERVER_1 = "pool.ntp.org";
@@ -540,8 +544,61 @@ void publishWateringEvent(int plantIndex, int level, const char* source) {
   mqttClient.publish(topic.c_str(), payload.c_str());
 }
 
+int getPumpIndex(int plantIndex) {
+  if (plantIndex >= 1 && plantIndex <= 2) {
+    return plantIndex - 1;
+  }
+
+  if (plantIndex >= 0 && plantIndex < 2) {
+    return plantIndex;
+  }
+
+  return -1;
+}
+
+unsigned long getWateringDurationMs(int level) {
+  if (level < 1) level = 1;
+  if (level > 10) level = 10;
+  return WATERING_MIN_DURATION_MS + (unsigned long)(level - 1) * WATERING_STEP_DURATION_MS;
+}
+
+bool runPumpForPlant(int plantIndex, int level) {
+  int pumpIndex = getPumpIndex(plantIndex);
+  if (pumpIndex < 0 || pumpIndex >= 2) {
+    printError("Некорректный индекс растения для полива");
+    return false;
+  }
+
+  if (!PUMP_ENABLED[pumpIndex]) {
+    printWarning("Насос для растения " + String(plantIndex) + " пока не подключен");
+    return false;
+  }
+
+  unsigned long durationMs = getWateringDurationMs(level);
+  int pin = PUMP_PINS[pumpIndex];
+
+  printSuccess(
+    String("Полив растения ") + String(plantIndex) +
+    ": насос D" + String(pin) +
+    ", уровень " + String(level) +
+    ", длительность " + String(durationMs) + " мс"
+  );
+
+  digitalWrite(pin, HIGH);
+  delay(durationMs);
+  digitalWrite(pin, LOW);
+  return true;
+}
+
 void performWatering(int plantIndex, int level, const char* source) {
   startWateringAnimation(plantIndex, level);
+  updateDisplay(true);
+
+  bool watered = runPumpForPlant(plantIndex, level);
+  if (!watered) {
+    return;
+  }
+
   publishWateringEvent(plantIndex, level, source);
 
   String sourceLabel = "manual";
@@ -552,7 +609,7 @@ void performWatering(int plantIndex, int level, const char* source) {
   }
 
   printSuccess(
-    String("[MOCK] Полив растения ") + String(plantIndex) +
+    String("Полив растения ") + String(plantIndex) +
     ", уровень: " + String(level) +
     ", источник: " + sourceLabel
   );
@@ -1228,8 +1285,13 @@ void setup() {
   printSuccess("DHT22 инициализирован на пине D4/GPIO4");
   pinMode(SOIL_SENSOR_PINS[0], INPUT);
   pinMode(SOIL_SENSOR_PINS[1], INPUT);
+  pinMode(PUMP_PINS[0], OUTPUT);
+  pinMode(PUMP_PINS[1], OUTPUT);
+  digitalWrite(PUMP_PINS[0], LOW);
+  digitalWrite(PUMP_PINS[1], LOW);
   updateSoilReadings(true);
   printSuccess("Датчики влажности почвы инициализированы на D34 и D35");
+  printSuccess("Насос 1 активирован на D26, насос 2 пока отключен");
   printSuccess("OLED инициализирован на D21/D22 (I2C)");
   updateDisplay(true);
 
