@@ -22,18 +22,18 @@ const char* DEFAULT_BACKEND_URL = "http://72.56.240.75:4000";
 const int MQTT_PORT = 1883;
 const unsigned long MQTT_RECONNECT_INTERVAL = 5000;
 const int DEFAULT_TELEMETRY_INTERVAL_MINUTES = 5;
-const int DHT_PIN = 4; // Board pin label: D4 / GPIO4
-const int SOIL_SENSOR_PINS[2] = {34, 35}; // Board pin labels: D34 / D35
+const int DHT_PIN = 4;
+const int SOIL_SENSOR_PINS[2] = {34, 35};
 const int SOIL_DRY_VALUES[2] = {3000, 3000};
 const int SOIL_WET_VALUES[2] = {1300, 1300};
 const int SOIL_SAMPLE_COUNT = 8;
 const unsigned long DHT_READ_INTERVAL = 2500;
-const int DISPLAY_SDA_PIN = 21; // Board pin label: D21 / GPIO21
-const int DISPLAY_SCL_PIN = 22; // Board pin label: D22 / GPIO22
+const int DISPLAY_SDA_PIN = 21;
+const int DISPLAY_SCL_PIN = 22;
 const unsigned long DISPLAY_REFRESH_INTERVAL = 120;
 const unsigned long SOIL_READ_INTERVAL = 1500;
 const unsigned long WATERING_ANIMATION_DURATION = 5000;
-const int PUMP_PINS[2] = {26, 27}; // Board pin labels: D26 / D27
+const int PUMP_PINS[2] = {26, 27};
 const bool PUMP_ENABLED[2] = {true, true};
 const unsigned long WATERING_MIN_DURATION_MS = 300;
 const unsigned long WATERING_STEP_DURATION_MS = 300;
@@ -90,11 +90,9 @@ DisplayState currentDisplayState = DISPLAY_BOOT;
 String displayPrimaryText = "usePlant";
 String displaySecondaryText = "starting";
 
-// ===== Structs =====
-
 struct SensorRule {
-  char field[16];     // "temperature", "airHumidity", "soilMoisture"
-  char op[4];         // "eq", "gt", "lt"
+  char field[16];
+  char op[4];
   float value;
 };
 
@@ -102,19 +100,19 @@ struct Schedule {
   int hours[6];
   int minutes[6];
   int timeCount;
-  bool days[7]; // 0=Sun .. 6=Sat
+  bool days[7];
 };
 
 struct WateringCondition {
   int plantIndex;
-  char type[10];      // "sensor" or "schedule"
-  int level;          // 1-10
-  int interval;       // minutes
+  char type[10];
+  int level;
+  int interval;
   SensorRule rules[4];
   int ruleCount;
   Schedule schedule;
   bool enabled;
-  unsigned long lastTriggered; // millis when last watered
+  unsigned long lastTriggered;
   long lastScheduleTriggerKey;
 };
 
@@ -362,8 +360,6 @@ void updateDisplay(bool force = false) {
   oled.sendBuffer();
 }
 
-// ===== Logging =====
-
 void printDebug(const String& message) {
   Serial.println("[DEBUG] " + message);
 }
@@ -384,13 +380,11 @@ void printJson(const String& label, const String& json) {
   Serial.println("[JSON] " + label + ": " + json);
 }
 
-// ===== Watering Conditions =====
-
 const int MAX_CONDITIONS = 8;
 WateringCondition waterConditions[MAX_CONDITIONS];
 int conditionCount = 0;
 unsigned long lastConditionCheck = 0;
-const unsigned long CONDITION_CHECK_INTERVAL = 10000; // check every 10 seconds
+const unsigned long CONDITION_CHECK_INTERVAL = 10000;
 
 void saveConditionsToNVS() {
   StaticJsonDocument<4096> doc;
@@ -692,8 +686,6 @@ void checkConditions() {
   }
 }
 
-// ===== Sensors (mock) =====
-
 int getSoilSensorIndex(int plantIndex) {
   if (plantIndex >= 1 && plantIndex <= 2) {
     return plantIndex - 1;
@@ -800,11 +792,6 @@ float getSoilMoisture(int plantIndex) {
 
   return lastSoilMoisture[sensorIndex];
 }
-
-// ===== Command Handlers =====
-// Чтобы добавить новую команду:
-// 1. Добавить функцию handleCmd_<имя>(JsonObject& payload)
-// 2. Зарегистрировать в registerCommands()
 
 struct CommandEntry {
   const char* type;
@@ -930,8 +917,6 @@ void executeCommand(const String& type, JsonObject& payload) {
   printWarning("Неизвестная команда: " + type);
 }
 
-// ===== MQTT =====
-
 void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   String message;
   message.reserve(length);
@@ -1005,8 +990,6 @@ void connectMqtt() {
   }
 }
 
-// ===== Backend =====
-
 BackendResponse parseBackendResponse(const String& jsonResponse) {
   printDebug("Парсинг ответа от бэкенда");
   printJson("Получен JSON", jsonResponse);
@@ -1075,8 +1058,6 @@ BackendResponse registerDeviceWithBackend(const String& deviceId, const String& 
   return response;
 }
 
-// ===== HTTP Responses =====
-
 void sendSuccessResponse(const JsonDocument& data) {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -1130,8 +1111,6 @@ void handleOptions() {
   server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
   server.send(200);
 }
-
-// ===== Access Point =====
 
 void startAccessPoint() {
   printSuccess("Запуск точки доступа...");
@@ -1214,7 +1193,6 @@ void startAccessPoint() {
 
     printDebug("Сохранение настроек WiFi");
 
-    // Сохраняем настройки, но НЕ регистрируемся на бэкенде
     preferences.begin("wifi", false);
     preferences.putString("ssid", ssid);
     preferences.putString("password", password);
@@ -1261,8 +1239,6 @@ void clearWiFiSettings() {
   printSuccess("WiFi настройки очищены");
 }
 
-// ===== Setup & Loop =====
-
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -1272,11 +1248,6 @@ void setup() {
   oled.setContrast(180);
   setDisplayState(DISPLAY_BOOT, "usePlant", "starting");
   updateDisplay(true);
-
-  Serial.println();
-  Serial.println("=================================");
-  Serial.println("🌱 PlantWatering ESP32");
-  Serial.println("=================================");
 
   String deviceId = String((uint32_t)ESP.getEfuseMac(), HEX);
   printSuccess("Device ID: " + deviceId);
@@ -1298,7 +1269,6 @@ void setup() {
   registerCommands();
   loadConditionsFromNVS();
 
-  // Загружаем настройки
   preferences.begin("wifi", false);
   savedSSID = preferences.getString("ssid", "");
   savedPassword = preferences.getString("password", "");
@@ -1348,7 +1318,6 @@ void setup() {
       setupClock();
       printSuccess("NTP-синхронизация времени запрошена");
 
-      // Если есть токен, но нет deviceSecret - регистрируемся
       if (savedToken.length() > 0 && savedDeviceSecret.length() == 0) {
         printDebug("Устройство не зарегистрировано. Регистрация на бэкенде...");
         setDisplayState(DISPLAY_REGISTERING, "Preparing", "saving setup");
@@ -1360,7 +1329,6 @@ void setup() {
         if (response.success) {
           printSuccess("Устройство зарегистрировано!");
 
-          // Сохраняем deviceSecret и удаляем токен
           preferences.begin("wifi", false);
           preferences.putString("deviceSecret", response.deviceSecret);
           preferences.remove("token");
@@ -1377,7 +1345,6 @@ void setup() {
         printSuccess("Устройство уже зарегистрировано");
       }
 
-      // Настраиваем MQTT и переходим в нормальный режим
       mqttClient.setServer(savedMqttServer.c_str(), MQTT_PORT);
       mqttClient.setCallback(onMqttMessage);
       mqttClient.setBufferSize(2048);
@@ -1414,7 +1381,6 @@ void loop() {
       ESP.restart();
     }
   } else {
-    // Нормальный режим работы
     if (WiFi.status() != WL_CONNECTED) {
       printError("Потеряно соединение с WiFi!");
       startAccessPoint();
@@ -1422,7 +1388,6 @@ void loop() {
       return;
     }
 
-    // MQTT reconnect
     if (!mqttClient.connected()) {
       setDisplayState(DISPLAY_MQTT_CONNECTING, "Connecting", "restoring link");
       unsigned long now = millis();
@@ -1436,14 +1401,12 @@ void loop() {
 
     mqttClient.loop();
 
-    // Отправка телеметрии по настроенному интервалу
     unsigned long now2 = millis();
     if (now2 - lastTelemetrySend > telemetryIntervalMs) {
       lastTelemetrySend = now2;
       sendTelemetry();
     }
 
-    // Проверка условий полива
     if (now2 - lastConditionCheck > CONDITION_CHECK_INTERVAL) {
       lastConditionCheck = now2;
       checkConditions();
